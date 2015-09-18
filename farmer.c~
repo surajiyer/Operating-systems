@@ -1,0 +1,172 @@
+/* 
+ * Operating Systems  (2INC0)  Practical Assignment
+ * Interprocess Communication
+ *
+ * S.S. Iyer (866094)
+ * Xiang Teng (851499)
+ *
+ * Grading:
+ * Students who hand in clean code that fully satisfies the minimum requirements will get an 8. 
+ * ”Extra” steps can lead to higher marks because we want students to take the initiative. 
+ * Extra steps can be, for example, in the form of measurements added to your code, a formal 
+ * analysis of deadlock freeness etc.
+ */
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <stdbool.h>
+#include <string.h>
+#include <sys/wait.h>
+#include <sys/types.h>
+#include <sys/stat.h>
+#include <errno.h>    
+#include <unistd.h>         // for execlp
+#include <mqueue.h>         // for mq
+
+#include "settings.h"
+#include "output.h"
+#include "common.h"
+
+
+int main (int argc, char * argv[])
+{
+    if (argc != 1)
+    {
+        fprintf (stderr, "%s: invalid arguments\n", argv[0]);
+    }
+        
+    output_init ();
+
+    // TODO:
+    //  * create the message queues & the children
+    //  * do the farming (use output_draw_pixel() for the coloring
+    //  * wait until the chilren have been stopped
+    //  * clean up the message queues
+
+    // Important notice: make sure that your message queues contain your
+    // student name and the process id (to ensure uniqueness during testing)
+	pid_t			pids[NROF_WORKERS];     /* Process ID from fork() */
+	pid_t			pid_read_response;	/* Process ID from fork() for reading the response queue */
+	mqd_t			mq_fd_request;		/* Farmer request queue */
+	mqd_t			mq_fd_response;		/* Worker response queue */
+	MQ_MESSAGE*		req;			/* a request message */
+	MQ_MESSAGE*		rsp;			/* a response message */
+	rsp = (MQ_MESSAGE*) malloc(sizeof(MQ_MESSAGE)); /* Allocate memory once for the response message */
+	struct mq_attr	attr;				/* stores the attributes of the message queues */
+
+	/* create names for the message queues */
+	char* mq_name1, *mq_name2;
+	mq_name1 = (char*) malloc(strlen(STUDENT_NAME_1)*sizeof(char));
+	mq_name2 = (char*) malloc(strlen(STUDENT_NAME_2)*sizeof(char));
+	sprintf(mq_name1, "/mq_request_%s_%d", STUDENT_NAME_1, getpid());
+	sprintf(mq_name2, "/mq_response_%s_%d", STUDENT_NAME_2, getpid());
+
+	/* Modify attributes and open up a farmer request and a worker response queue */
+	attr.mq_maxmsg = MQ_MAX_MESSAGES;
+	attr.mq_msgsize = sizeof(MQ_MESSAGE);
+	mq_fd_request = mq_open(mq_name1, O_WRONLY | O_CREAT | O_EXCL, 0600, &attr);
+	mq_fd_response = mq_open(mq_name2, O_RDONLY | O_CREAT | O_EXCL, 0600, &attr);
+
+	/* Start worker children */
+	int i;
+	for (i = 0; i < NROF_WORKERS; ++i) {
+		if ((pids[i] = fork()) < 0) {
+			perror("fork() failed");
+			exit(1);
+		}
+		else if (pids[i] == 0) {
+			execlp ("/worker", "/worker", mq_name1, mq_name2, NULL);
+
+			// this should never be reached
+			exit(0);
+		}
+	}
+
+	// Read the response simultaeneously on a another new process
+	if ((pid_read_response = fork()) < 0) {
+		perror("fork() failed");
+		exit(1);
+	}
+	else if (pid_read_response == 0)
+	{
+		int num_active_workers = NROF_WORKERS;
+
+		while (1) {
+			// read the result and store it in the response message
+			printf("		parent: receiving...\n");
+			int ret = mq_receive(mq_fd_response, (char *)&rsp, sizeof(rsp), NULL);
+			printf(" return val: %d", ret);
+			printf("mType: %d", rsp->mType);
+			// Continue receiving messages from the response queue until 
+			// every worker is inactive.
+			if (rsp->mType == -1) {
+				if (--num_active_workers == 0) {
+					printf("		parent: shutting down...\n");
+					break;
+				}
+				printf("	parent: %i workers active...\n", num_active_workers);
+				continue;
+			} // else if it is a normal response message
+			else if (rsp->mType == 1) 
+			{
+				// draw the pixel in the output
+				printf("		parent: received: %d\n", rsp->pix_color);
+				output_draw_pixel(rsp->x, rsp->y, rsp->pix_color);
+			}
+
+			sleep(1);
+		}
+	}
+	else 
+	{
+		// send requests to worker
+		double x, y;
+		for (x = X_LOWERLEFT; x < X_LOWERLEFT + ((X_PIXEL - 1)*STEP); x += STEP) {
+			for (y = Y_LOWERLEFT; y < Y_LOWERLEFT + ((Y_PIXEL - 1)*STEP); y += STEP) {
+
+				// create a new request message
+				req = (MQ_MESSAGE *)malloc(sizeof(MQ_MESSAGE));
+
+				// fill the request message
+				req->mType = 0;
+				req->x = x;
+				req->y = y;
+				req->pix_color = -1;
+
+				// send a request message
+				//printf("parent: sending...\n");
+				//mq_send(mq_fd_request, (char *)&req, sizeof(req), 0);
+				sleep(1);
+			}
+		}
+
+		for(i = 0; i < NROF_WORKERS; ++i) {
+			// create a new request message
+			req = (MQ_MESSAGE *)malloc(sizeof(MQ_MESSAGE));
+
+			// Send kill message to shut down active worker processes
+			req->mType = -1;
+
+			// send a request message
+			printf("parent: sending kill message...\n");
+			mq_send(mq_fd_request, (char *)&req, sizeof(req), 0);
+			sleep(1);
+		}
+
+		// wait for the child to close
+		waitpid(pid_read_response, NULL, 0);
+
+		// close the queues and deallocate its memory
+		mq_close(mq_fd_response);
+		mq_close(mq_fd_request);
+		mq_unlink(mq_name1);
+		mq_unlink(mq_name2);
+
+		// close the output
+		output_end();
+		printf("All Done!");
+	}
+    
+    return (0);
+}
+
